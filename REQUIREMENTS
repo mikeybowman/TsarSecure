@@ -1,0 +1,101 @@
+TsarSecure v2.0 - Software Requirements
+
+1. Introduction
+This document outlines the functional and non-functional requirements for TsarSecure v2.0, a desktop application designed to assist users in generating and evaluating strong, secure passwords and passphrases. The primary goal is to provide a robust, intuitive, and visually engaging tool that enhances personal cybersecurity.
+
+2. Functional Requirements (What the software does)
+2.1 Password Generation
+FR1.1 Character-Based Password Generation: The system SHALL allow users to generate passwords composed of a customizable set of character types:
+
+Lowercase letters (a-z)
+
+Uppercase letters (A-Z)
+
+Digits (0-9)
+
+Special characters (from string.punctuation)
+
+FR1.2 Customizable Length/Word Count: The system SHALL allow users to specify the length of generated character-based passwords (e.g., 5 to 50 characters) and the number of words for passphrases (e.g., 3 to 10 words) via a slider.
+
+FR1.3 Passphrase Generation Mode: The system SHALL provide a toggle (checkbox) to switch between character-based password generation and passphrase generation.
+
+When in passphrase mode, the character type selection checkboxes SHALL be disabled.
+
+Passphrases SHALL be generated using a predefined Diceware-style wordlist.
+
+Passphrases SHALL be joined by hyphens.
+
+FR1.4 Secure Randomness: All generated passwords/passphrases SHALL use a cryptographically secure pseudo-random number generator (e.g., Python's secrets module).
+
+FR1.5 Error Handling for Generation: If no character types are selected (in character mode) or an insufficient word count is selected (in passphrase mode), the system SHALL display a clear, temporary error message to the user within the main window.
+
+2.2 Password Analysis
+FR2.1 Entropy Calculation: The system SHALL calculate and display the cryptographic entropy (in bits) for both generated passwords/passphrases and user-input passwords.
+
+For character-based passwords, entropy SHALL be length * log2(charset_size).
+
+For passphrases, entropy SHALL be word_count * log2(wordlist_size).
+
+For user-input passwords, the system SHALL heuristically estimate the charset size or detect Diceware format for entropy calculation.
+
+FR2.2 Strength Categorization: The system SHALL categorize password strength based on entropy thresholds (e.g., "Breach Imminent!", "Exploitable", "Hardened", "Godlike").
+
+FR2.3 Time-to-Crack Estimation: The system SHALL provide a human-readable, estimated time it would take to brute-force a password based on its entropy.
+
+FR2.4 "Check My Password" Input: The system SHALL provide a dedicated input field where users can paste or type an arbitrary password to have its strength analyzed.
+
+2.3 User Interaction
+FR3.1 Password Display: Generated passwords SHALL be displayed in a read-only text entry field.
+
+FR3.2 Password Auto-Clear: Generated passwords SHALL automatically clear from the display field after 30 seconds for security.
+
+FR3.3 Copy to Clipboard: The system SHALL provide a button to copy the displayed password to the system clipboard.
+
+FR3.4 Copy Confirmation: Upon copying, the system SHALL temporarily display "Password Copied!" directly within the password display field, then revert to the password (or cleared state).
+
+FR3.5 Lock Computer Functionality: The system SHALL provide a button to immediately lock the user's Windows computer session.
+
+3. Non-Functional Requirements (How well the software performs)
+3.1 Usability
+NFR3.1.1 Intuitive Interface: The UI SHALL be clean, logical, and easy for new users to understand and navigate.
+
+NFR3.1.2 Visual Feedback: The system SHALL provide clear visual feedback for user actions (e.g., button clicks, copy confirmation, strength changes).
+
+NFR3.1.3 Consistency: UI elements (colors, fonts, spacing) SHALL maintain a consistent theme throughout the application.
+
+3.2 Performance
+NFR3.2.1 Responsiveness: The application UI SHALL remain responsive to user input and window resizing without significant lag.
+
+NFR3.2.2 Fast Generation: Password and passphrase generation SHALL be near-instantaneous.
+
+NFR3.2.3 Fast Analysis: Password strength analysis SHALL be near-instantaneous.
+
+3.3 Security
+NFR3.3.1 Data Integrity: Generated passwords SHALL be based on secure random principles, resisting predictable patterns.
+
+NFR3.3.2 Memory Protection: The application SHALL attempt to mitigate leaving sensitive password data in accessible memory (e.g., via overwriting).
+
+NFR3.3.3 No Persistence: The application SHALL NOT store generated or checked passwords/passphrases locally or remotely.
+
+3.4 Maintainability
+NFR3.4.1 Clear Code Structure: The codebase SHALL be organized into logical sections with clear comments and docstrings.
+
+NFR3.4.2 Readability: The code SHALL be easily understandable by other Python developers.
+
+3.5 Portability/Deployment
+NFR3.5.1 Self-Contained Executable: The application SHALL be distributable as a single .exe file for Windows, requiring no external Python installation for the end-user.
+
+NFR3.5.2 Icon: The .exe SHALL have a custom application icon (ts.ico).
+
+4. Constraints
+C4.1 Operating System: The application's "Lock Computer" functionality is explicitly limited to Windows operating systems due to the use of platform-specific commands.
+
+C4.2 UI Framework: The application is built using Tkinter, which limits advanced graphical effects like true desktop blurring (only translucency is supported).
+
+C4.3 Font Dependency: The "Consolas" font (and any other system fonts used) is assumed to be present on the target Windows OS.
+
+C4.4 Diceware Wordlist Size: The embedded Diceware wordlist is a subset for example purposes; a larger wordlist would be required for maximum passphrase entropy, but this would increase executable size.
+
+C4.5 No Network Access: The application SHALL NOT require or attempt any network access.
+
+C4.6 No Storage: The application SHALL NOT store user data locally (e.g., settings, generated passwords).
