@@ -64,7 +64,7 @@ Security Actions:
 # Building from Source (for Developers)
 If you want to build the .exe yourself, contribute to the project, or inspect the code:
 
-#Clone the repository:
+# Clone the repository:
 
 git clone https://github.com/mikeybowman/TsarSecure.git
 cd TsarSecure
