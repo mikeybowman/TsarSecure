@@ -1,104 +1,86 @@
-# TsarSecure
-TsarSecure is a powerful, user-friendly desktop application for Windows, crafted to help you generate and analyze truly secure passwords and passphrases. With its intuitive, minimalist interface and a focus on cryptographic integrity, TsarSecure empowers you to strengthen your online security with confidence.
+# TsarSecure v2.5.0
 
-##Features:
-```
-∙ Entropy-Based Strength Analysis: Beyond simple rules, TsarSecure calculates the cryptographic entropy (in bits) of generated and input passwords, providing a mathematically accurate measure of their unpredictability and brute-force resistance.
+TsarSecure is a powerful, privacy-focused desktop application for Windows, built to help you generate and assess truly secure passwords and passphrases.  
+With a modern, dark UI and a focus on **real-world security**, TsarSecure 2.5.0 combines **mathematical strength analysis** with **breach detection** to give you the most complete password risk assessment possible.
 
-∙ Time-to-Crack Estimation: Get a clear, human-readable estimate of how long it would take a malicious party to brute-force your password, ranging from "Instantly" to "Billions of Years."
+---
 
-∙ Versatile Generation Modes:
+## 🆕 What’s New in 2.5.0
 
-∙ Character-Based Passwords: Generate strong, random passwords using customizable combinations of lowercase, uppercase, digits, and special characters.
+### New Features
+- **Breach Detection** – Checks passwords against the HaveIBeenPwned database (800M+ compromised passwords) using a privacy-preserving k-anonymity API.
+- **Full Diceware Support** – References all 7,776 words for stronger, more varied passphrase generation.
+- **Passphrase Generation Tab** – Dedicated UI for multi-word passphrases.
+- **Clipboard Countdown** – Live countdown from 30 seconds before clipboard auto-clear.
+- **Copy Button Lockout** – Copy button is disabled until clipboard is cleared or a new password is generated.
 
-∙ Passphrase Mode: Create memorable, high-entropy passphrases by selecting multiple random words from a secure wordlist.
+### Logic & Security Improvements
+- Stronger subprocess handling for locking the computer.
+- Safer clipboard operations with verification.
+- Better exception handling and thread safety.
+- Improved secure memory clearing to minimize sensitive data exposure.
+- Granular strength ratings (Very Weak → Excellent).
+- More accurate entropy calculation and crack time estimates.
 
-∙ "Check My Password" Functionality: Input any existing password to instantly analyze its strength, entropy, and estimated time-to-crack.
+### UI Refinements
+- Larger main window to fit new features.
+- Clearer button labels and tooltips.
+- Dual display for entropy and breach results.
+- Modernized layout for faster navigation.
 
-∙ Enhanced Security Measures:
+---
 
-∙ Utilizes Python's secrets module for cryptographically secure randomness.
+## 🔐 Core Features
+- **Entropy-Based Strength Analysis** – Calculates true cryptographic entropy in bits.
+- **Time-to-Crack Estimates** – From “Instantly” to “Billions of Years.”
+- **Character-Based Passwords** – Customizable lowercase, uppercase, digits, and symbols.
+- **Passphrase Mode** – Random multi-word passphrases from a secure Diceware list.
+- **Breach Risk Classification** – SAFE → LOW → MEDIUM → HIGH → CRITICAL.
+- **Privacy Protection** – Never sends full passwords to external services.
+- **Clipboard Auto-Clear** – Wipes copied passwords after 30 seconds.
+- **Lock Computer** – Secure your session instantly from the app.
 
-∙ Attempts to overwrite password data in memory after use for enhanced privacy.
+---
 
-∙ Password display automatically clears after 30 seconds for added security.
+## 📥 How to Use
+1. **Download** the latest TsarSecure.exe from the [Releases](../../releases) page.
+2. Run the executable — no install or Python needed.
 
-∙ "Password Copied!" confirmation appears directly in the password field and fades away.
+---
 
-∙ "Lock Computer" Button: Quickly secure your workstation directly from the application with a single click (Windows only).
-
-∙ Sleek & Responsive Design: Enjoy a modern, dark-themed interface with Consolas font and neon accents that automatically adapts to your window size and keeps elements centered.
-
-∙ Translucent Window: Provides a subtle, see-through effect for a modern desktop integration.
-```
-
-## How to Use
-# Get Started:
-```
-Download the latest TsarSecure.exe from the Releases page.
-
-Run the executable. No installation or Python required!
-```
-# Generating Passwords:
-```
-Adjust Length/Words: Use the slider to choose your desired password length (for character-based passwords) or word count (for passphrases).
-
-Select Character Types: Check or uncheck the boxes for lowercase, uppercase, numbers, and special characters. These options will be automatically disabled when "Passphrase Mode" is active.
-
-"Passphrase Mode": Toggle this checkbox to switch between generating random character strings and multi-word passphrases.
-
-"Generate Password": Click this button to create your new secure password or passphrase.
-```
-# Checking Passwords:
-```
-Type or paste any password into the "Check Your Own Password" input field.
-
-Click "Check Strength" to instantly see its calculated entropy, strength rating, and estimated crack time.
-```
-Security Actions:
-```
-"Copy Password": Copies the generated password to your system clipboard. A "Password Copied!" message will briefly appear in the password display box.
-
-"Lock Computer": Immediately locks your Windows session, requiring your PIN or password to unlock.
-```
-# Building from Source (for Developers)
-If you want to build the .exe yourself, contribute to the project, or inspect the code:
-
-# Clone the repository:
-
+## ⚙️ Developer & Build Instructions
+```bash
+# Clone repo
 git clone https://github.com/mikeybowman/TsarSecure.git
 cd TsarSecure
 
-Install Python: Ensure you have Python 3.7+ installed.
+# Install dependencies
+pip install -r requirements.txt
 
-Install dependencies:
+# Build Consumer Edition
+pyinstaller TsarSecure.spec --clean
 
-pip install pyinstaller
+# Build Developer Edition (console on)
+pyinstaller TsarSecure_Dev.spec --clean
+```
+Binaries will be in the `dist/` folder.
 
-Place ts.ico: Make sure your ts.ico icon file is in the TsarSecure project directory (same level as TsarSecure.py).
+---
 
-Build the executable:
+## 📜 License
+Open-source under the MIT License. See the LICENSE file for details.
 
-pyinstaller --onefile --windowed --icon=ts.ico TsarSecure.py
+---
 
-The TsarSecure.exe file will be created in the dist/ subdirectory.
-
-License
-This project is open-source under the MIT License. See the LICENSE file for more details.
-
-Contributing
-Contributions are welcome! If you find bugs, have feature suggestions, or want to contribute code:
-
-Fork the repository.
-
-Create a new branch (git checkout -b feature/YourFeature).
-
-Make your changes.
-
-Commit your changes (git commit -m 'Add new feature').
-
-Push to the branch (git push origin feature/YourFeature).
-
-Open a Pull Request.
-
-Author: Tsardev
+## 🤝 Contributing
+1. Fork the repository.
+2. Create a feature branch:  
+   ```bash
+   git checkout -b feature/MyFeature
+   ```
+3. Commit changes and push:  
+   ```bash
+   git commit -m "feat: Add my new feature"
+   git push origin feature/MyFeature
+   ```
+4. Open a Pull Request into `dev`.

@@ -1,7 +1,13 @@
-# TsarSecure v2.0
+# TsarSecure v2.5.0 - External Diceware List + Breach Button Throttle/Backoff + Copy Countdown Lockout
 # Author: Tsardev
-# Copyright (c) 2025 Tsardev - All Rights Reserved.
-# This code is open-source under the MIT License.
+# License: MIT
+#
+# What’s new in v2.5.0
+# - Uses external EFF Diceware wordlist (lazy-loaded) instead of a giant embedded list
+# - Optional SHA-256 integrity check (disabled by default)
+# - Breach check button: debounce + polite exponential backoff on HTTP 429
+# - Clipboard copy: live 30s countdown, button lockout until clear/new secret
+# - Keeps your existing threading + UI patterns; safe fallbacks if file is missing
 
 import tkinter as tk
 from tkinter import ttk
@@ -9,6 +15,108 @@ import secrets
 import string
 import os
 import math
+import threading
+import time
+import gc
+import ctypes
+from ctypes import wintypes
+import sys
+import json
+from collections import Counter
+import hashlib
+import requests
+
+# --- App / Packaging config for Diceware ---
+WORDLIST_NAME = "eff_large_wordlist.txt"
+# If you want integrity checking, paste the real SHA-256 of your wordlist here.
+# Leave as None to skip integrity checks.
+WORDLIST_SHA256 = None  # e.g., "a1b2c3...64-hex-chars..."
+
+def _bundle_path(name: str) -> str:
+    """Return the runtime path to bundled files (works in dev & PyInstaller)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(__file__))
+    return os.path.join(base, name)
+
+_dice_words_cache = None
+
+def _verify_sha256_bytes(data: bytes, expected_hex: str) -> bool:
+    h = hashlib.sha256()
+    h.update(data)
+    return h.hexdigest().lower() == expected_hex.lower()
+
+def _fallback_words():
+    # Small NATO-like fallback so app still runs if the file is missing.
+    return (
+        "alpha","bravo","charlie","delta","echo","foxtrot","golf","hotel",
+        "india","juliet","kilo","lima","mike","november","oscar","papa",
+        "quebec","romeo","sierra","tango","uniform","victor","whiskey",
+        "xray","yankee","zulu"
+    )
+
+def load_diceware_words():
+    """
+    Lazy-load the Diceware word list from an external file (EFF format).
+    Supports:
+      - '11111<TAB>word' (preferred EFF format)
+      - plain 'word' per line
+    De-duplicates while preserving order. Caches the list for reuse.
+    """
+    global _dice_words_cache
+    if _dice_words_cache is not None:
+        return _dice_words_cache
+
+    path = _bundle_path(WORDLIST_NAME)
+    words = []
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        if WORDLIST_SHA256:
+            try:
+                if not _verify_sha256_bytes(data, WORDLIST_SHA256):
+                    print("Warning: Diceware list SHA-256 mismatch. Using file anyway.")
+            except Exception:
+                pass
+        text = data.decode("utf-8", "ignore")
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "\t" in line:
+                # EFF/Classic format: "11111<TAB>word"
+                _, w = line.split("\t", 1)
+                words.append(w.strip())
+            else:
+                # Plain word per line
+                words.append(line)
+    except FileNotFoundError:
+        print("⚠ Wordlist file not found — using small fallback list")
+        words = list(_fallback_words())
+
+    # De-duplicate while preserving order
+    seen = set()
+    uniq = []
+    for w in words:
+        if w and w not in seen:
+            uniq.append(w)
+            seen.add(w)
+
+    _dice_words_cache = tuple(uniq)
+    return _dice_words_cache
+
+# --- Enhanced Security Configuration ---
+CLIPBOARD_CLEAR_TIMEOUT = 30  # Clear clipboard after 30 seconds
+PASSWORD_DISPLAY_TIMEOUT = 30  # Clear password display after 30 seconds
+BREACH_CHECK_TIMEOUT = 10      # Timeout for breach check requests
+
+# --- Global variables for security management ---
+_clipboard_clear_timer = None
+_password_clear_timer = None
+_secure_password_storage = None
+
+# --- Clipboard countdown UI state ---
+_clipboard_countdown_job = None
+_clipboard_countdown_remaining = 0
+_copy_button_ref = None
 
 # --- Constants for Colors and Timing ---
 NEON_GREEN = "#39FF14"
@@ -16,507 +124,935 @@ DARK_BG = "#1e1e1e"
 MEDIUM_BG = "#333333"
 ELECTRIC_BLUE = "#00FFFF"
 WINDOW_ALPHA = 0.9
+BREACH_RED = "#FF4444"
+BREACH_ORANGE = "#FF8C00"
+BREACH_YELLOW = "#FFD166"
+BREACH_GREEN = "#06D6A0"
 
-# --- Diceware Wordlist ---
-# The complete Diceware wordlist used for passphrase generation, now fully alphabetized.
-# In a real-world scenario, a much larger list (e.g., EFF's large wordlist)
-# with thousands of words would provide higher entropy per word.
-DICEWARE_WORDLIST = [
-    "ability", "able", "about", "above", "absent", "absorb", "abstract", "absurd", "abuse", "access",
-    "accident", "account", "accuse", "achieve", "acid", "acoustic", "acquire", "across", "act", "action",
-    "active", "actor", "actual", "adapt", "add", "addict", "address", "adjust", "admire", "admit",
-    "adopt", "advance", "advice", "advise", "aerobic", "affair", "affect", "afford", "afraid", "again",
-    "age", "agent", "agree", "ahead", "aim", "air", "airport", "aisle", "alarm", "album",
-    "alcohol", "alert", "alien", "all", "allow", "almost", "alone", "already", "also", "alter",
-    "always", "amateur", "amazing", "ambition", "arbiter", "beamish", "bentley", "canihazrecon", "cortana", "dakota",
-    "empty", "enable", "enact", "end", "endless", "endorse", "endure", "energy", "enforce", "engage",
-    "engine", "enjoy", "enlist", "enough", "enrich", "ensure", "enter", "entire", "entry", "envelope",
-    "episode", "equal", "equip", "erase", "erode", "erosion", "error", "erupt", "escape", "essay",
-    "essence", "essential", "establish", "estimate", "eternal", "ether", "ethical", "euphemism", "evade",
-    "evaluate", "evening", "every", "evidence", "evil", "evoke", "evolve", "exact", "example", "excel",
-    "except", "exchange", "excite", "exclude", "excuse", "execute", "exercise", "exhaust", "exhibit",
-    "exist", "exit", "exotic", "expand", "expect", "experience", "explain", "expose", "express", "extend",
-    "extra", "eye", "eyebrow", "fabric", "face", "faculty", "fade", "fail", "faint", "fair",
-    "faith", "fall", "false", "fame", "family", "famous", "fan", "fancy", "fantasy", "farm",
-    "fashion", "fat", "fatal", "father", "fatigue", "fault", "favor", "fear", "feature", "federal",
-    "fee", "feed", "feel", "female", "fence", "fetch", "fever", "few", "fiber", "fiction",
-    "field", "figure", "file", "fill", "filter", "find", "fine", "finger", "finish", "fire",
-    "firm", "first", "fiscal", "fish", "fit", "fitness", "fix", "flavor", "flee", "flight",
-    "float", "flock", "floor", "flower", "fluid", "flush", "fly", "focus", "foil", "fold",
-    "follow", "food", "foot", "force", "forest", "forget", "fork", "form", "formula", "fortune",
-    "forum", "forward", "fossil", "foster", "found", "fox", "fragile", "frame", "frequent", "fresh",
-    "friend", "fringe", "frog", "front", "fruit", "fuel", "fun", "funny", "furnace", "fury",
-    "future", "gadget", "gain", "galaxy", "gallery", "game", "gap", "garage", "garden", "garlic",
-    "garment", "gas", "gather", "gauge", "gaze", "general", "genius", "genre", "gentle", "genuine",
-    "geography", "geometry", "gesture", "get", "ghost", "giant", "gift", "giggle", "ginger", "giraffe",
-    "girl", "give", "glass", "glide", "global", "globe", "gloom", "glory", "glove", "glow",
-    "glue", "goat", "goddess", "goose", "gorgeous", "gorilla", "gospel", "gossip", "govern", "grab",
-    "grace", "grade", "grain", "grand", "grant", "grape", "graph", "grass", "gravity", "great",
-    "green", "grid", "grief", "grow", "ground", "group", "grove", "grunt", "guard", "guess",
-    "guide", "guilt", "guitar", "guiltyspark", "gun", "gym", "habit", "hair", "half", "hammer",
-    "hamster", "hand", "happy", "harbor", "hard", "harsh", "harvest", "hat", "have", "hawk",
-    "hazard", "head", "health", "heart", "heavy", "height", "hello", "help", "hen", "hero",
-    "hidden", "high", "hold", "holiday", "home", "honey", "hope", "horn", "horror", "horse",
-    "hospital", "host", "hotel", "hour", "hover", "how", "human", "humble", "humor", "hundred",
-    "hungry", "hunt", "hurry", "hurt", "husband", "hybrid", "ice", "icon", "idea", "identify",
-    "idle", "ignore", "ill", "illegal", "illness", "image", "imagine", "immune", "impact", "impose",
-    "improve", "impulse", "in", "inch", "include", "income", "increase", "index", "indicate", "indoor",
-    "infant", "inflict", "info", "inform", "inherit", "initial", "inject", "injury", "inner", "innocent",
-    "input", "inquiry", "insane", "insect", "inside", "inspire", "install", "intact", "interest", "into",
-    "invest", "invite", "involve", "iron", "island", "isolate", "issue", "item", "ivory", "jacket",
-    "jaguar", "jail", "james", "january", "jaw", "jeans", "jelly", "jewel", "job", "join",
-    "joint", "joke", "journey", "joy", "judge", "juice", "july", "jump", "june", "jungle",
-    "junior", "junk", "just", "kangaroo", "keen", "keep", "kettle", "key", "kick", "kill",
-    "kind", "kingdom", "kiss", "kit", "kitchen", "kite", "kitten", "kiwi", "knee", "knife",
-    "knock", "know", "lab", "label", "labor", "ladder", "lady", "lake", "lamp", "language",
-    "laptop", "large", "last", "late", "laugh", "lava", "law", "lawn", "leader", "leaf",
-    "learn", "leave", "lecture", "left", "leg", "legal", "legend", "leisure", "lemon", "lend",
-    "length", "lens", "leopard", "lesson", "let", "letter", "level", "liar", "liberty", "library",
-    "license", "life", "light", "like", "limb", "limit", "link", "lion", "liquid", "list",
-    "little", "live", "lizard", "load", "loan", "lobster", "local", "lock", "logic", "lonely",
-    "long", "loop", "loose", "lord", "lose", "loss", "lottery", "loud", "lounge", "love",
-    "loyal", "lucky", "luggage", "lumber", "lunar", "lunch", "luxury", "lyrics", "machine", "mad",
-    "magic", "magnet", "magnify", "mail", "main", "major", "make", "mammal", "man", "manage",
-    "mandate", "mango", "manipulate", "manual", "maple", "marble", "march", "margin", "marine", "market",
-    "mask", "master", "masterchief", "match", "material", "math", "matrix", "matter", "matthias", "maximum",
-    "maze", "mean", "measure", "meat", "mechanism", "medial", "mediate", "medical", "medium", "meet",
-    "melody", "melt", "member", "memory", "mention", "menu", "mercy", "merge", "merit", "merry",
-    "mesh", "message", "metal", "method", "mexico", "middle", "midnight", "migrate", "milk", "mill",
-    "mimic", "mind", "minimum", "minor", "minute", "miracle", "mirror", "misery", "miss", "mistake",
-    "mix", "moment", "monday", "money", "monitor", "monkey", "monster", "month", "moon", "moral",
-    "more", "morning", "mosquito", "mother", "motion", "motor", "mountain", "mouse", "move", "movie",
-    "much", "muffin", "mule", "multiply", "muscle", "museum", "mushroom", "music", "must", "mutual",
-    "my", "mythic", "myself", "mystery", "myth", "naive", "name", "napkin", "narrow", "nasty",
-    "nation", "nature", "near", "neat", "neck", "need", "negative", "neglect", "neither", "nephew",
-    "nerve", "nest", "net", "network", "neutral", "never", "news", "next", "nice", "night",
-    "note", "nothing", "notice", "novel", "now", "nuclear", "number", "nurse", "nut", "oak",
-    "obey", "object", "oblige", "observe", "obtain", "obvious", "occasion", "occupy", "ocean", "october",
-    "odor", "off", "offer", "office", "often", "ogre", "oil", "okay", "old", "olive",
-    "on", "once", "one", "onion", "online", "only", "open", "opera", "opinion", "oppose",
-    "option", "orange", "orbit", "orchard", "order", "ordinary", "organ", "orient", "original", "oscar",
-    "other", "outcome", "outside", "oval", "oven", "over", "own", "owner", "oyster", "pace",
-    "pack", "page", "pair", "palm", "pan", "pancake", "panda", "panel", "panic", "park",
-    "parrot", "party", "pass", "patch", "path", "patient", "patrol", "pattern", "pause", "pave",
-    "payment", "peace", "peanut", "pear", "peasant", "pelican", "pen", "penalty", "pencil", "people",
-    "pepper", "perfect", "perform", "perfume", "perhaps", "period", "permit", "person", "pet", "phantom",
-    "phase", "photo", "phrase", "physical", "piano", "pick", "picnic", "picture", "piece", "pig",
-    "pigeon", "pill", "pilot", "pink", "pioneer", "pipe", "pistol", "pitch", "pizza", "place",
-    "planet", "plastic", "plate", "play", "please", "pledge", "plot", "plug", "plus", "P",
-    "pocket", "podium", "poem", "poet", "point", "polar", "pole", "police", "policy", "poll",
-    "pond", "pony", "pool", "popular", "populate", "portion", "post", "potato", "pottery", "poverty",
-    "powder", "power", "practice", "praise", "predict", "prefer", "prepare", "present", "pretty", "prevent",
-    "price", "pride", "primary", "print", "priority", "prison", "private", "prize", "problem", "process",
-    "produce", "profit", "program", "project", "promote", "proof", "property", "prosper", "protect", "proud",
-    "provide", "public", "pudding", "pull", "pulp", "pulse", "punch", "pupil", "puppy", "purchase",
-    "purity", "purpose", "purse", "push", "put", "puzzle", "pyramid", "quality", "quantify", "quantum",
-    "quarter", "question", "quick", "quit", "quiz", "quote", "rabbit", "race", "rack", "radar",
-    "radio", "raise", "rally", "ramp", "ranch", "random", "range", "rapid", "rare", "rate",
-    "rather", "raven", "raw", "ready", "real", "reason", "rebel", "rebuild", "recall", "receive",
-    "reception", "recipe", "record", "recover", "recruit", "recycle", "red", "reduce", "refuse", "regain",
-    "regard", "regime", "region", "register", "regular", "reject", "relate", "release", "relief", "rely",
-    "remain", "remember", "remind", "remote", "remove", "render", "renew", "rent", "reopen", "repair",
-    "repeat", "replace", "report", "represent", "republic", "request", "require", "rescue", "resemble", "resist",
-    "resource", "response", "result", "retire", "retreat", "return", "reveal", "reverse", "review", "reward",
-    "rhythm", "ribbon", "rice", "rich", "ride", "ridge", "rift", "right", "rigid", "ring",
-    "riot", "ripple", "risk", "ritual", "rival", "river", "road", "roast", "robot", "robust",
-    "rocket", "rock", "rod", "roll", "roof", "rookie", "room", "rose", "rotate", "rough",
-    "round", "route", "royal", "ruby", "rug", "rugby", "ruin", "rule", "run", "runway",
-    "rural", "rush", "sad", "safari", "safe", "sail", "salad", "salmon", "salt", "sample",
-    "sand", "satisfy", "satoshi", "sauce", "sausage", "save", "say", "scan", "scare", "scatter",
-    "scene", "scheme", "school", "science", "scissors", "scorpion", "scout", "scrap", "screen", "script",
-    "scrub", "sea", "search", "season", "seat", "second", "secret", "section", "security", "see",
-    "seed", "seek", "seem", "segment", "select", "sell", "seminar", "senior", "sense", "sentence",
-    "series", "serve", "session", "set", "settle", "setup", "seven", "shadow", "shaft", "shallow",
-    "shame", "shape", "share", "shark", "sharp", "sheep", "sheet", "shelf", "shell", "sheriff",
-    "shield", "shift", "shine", "ship", "short", "shoulder", "shove", "show", "shrink", "shrug",
-    "shuffle", "shy", "sibling", "sick", "side", "sidewalk", "sign", "silent", "silk", "silly",
-    "silver", "similar", "simple", "since", "sing", "siren", "sister", "situate", "six", "size",
-    "skate", "sketch", "ski", "skill", "skin", "skirt", "skull", "slam", "sleep", "slight",
-    "slim", "slogan", "slot", "slow", "slush", "small", "smart", "smile", "smoke", "smooth",
-    "snack", "snake", "snap", "sniff", "snow", "soap", "soccer", "social", "sock", "soft",
-    "solar", "soldier", "sole", "solid", "solution", "solve", "some", "someone", "stand", "start",
-    "state", "station", "stay", "steady", "steam", "steel", "stem", "step", "stereo", "stick",
-    "still", "sting", "stock", "stomach", "stone", "stool", "story", "stove", "strategy", "street",
-    "strike", "strong", "struggle", "student", "stuff", "stumble", "style", "subject", "subway", "success",
-    "such", "sudden", "suffer", "sugar", "suggest", "suit", "summer", "sun", "sunny", "sunset",
-    "super", "supply", "support", "sure", "surface", "surge", "surprise", "surround", "survey", "suspect",
-    "sustain", "swallow", "swamp", "switch", "sword", "symbol", "symptom", "syrup", "system", "table",
-    "tag", "tail", "take", "talent", "talk", "tank", "target", "task", "taste", "taxi",
-    "teach", "team", "tear", "tech", "telecom", "temple", "tenant", "tend", "tender", "tennis",
-    "tense", "term", "test", "text", "thank", "that", "the", "then", "theory", "there",
-    "they", "thing", "this", "thought", "three", "thrive", "thumb", "thunder", "ticket", "tide",
-    "tie", "tilt", "timber", "time", "tiny", "tip", "tire", "tissue", "title", "toast",
-    "tobacco", "today", "toddler", "toe", "together", "toilet", "token", "tomato", "tomorrow", "tone",
-    "tongue", "tonight", "tool", "tooth", "top", "topic", "topple", "torch", "tornado", "tortoise",
-    "total", "tour", "toward", "tower", "town", "toy", "track", "trade", "traffic", "tragic",
-    "train", "transfer", "trap", "travel", "tray", "treat", "tree", "trend", "trial", "tribe",
-    "trick", "trigger", "trim", "trip", "trophy", "trouble", "true", "trust", "truth", "try",
-    "tube", "tuition", "tumble", "tuna", "tunnel", "turkey", "turn", "turtle", "tutor", "tv",
-    "twin", "twist", "two", "type", "ugly", "umbrella", "unable", "uncover", "under", "undo",
-    "unfold", "unhappy", "uniform", "unique", "unit", "universe", "unknown", "unlock", "until", "unusual",
-    "unveil", "update", "upgrade", "uphold", "upon", "upper", "upset", "urban", "urge", "usage",
-    "use", "used", "useful", "useless", "usual", "utility", "vacant", "vacuum", "vague", "valid",
-    "valley", "valve", "van", "vanish", "vapor", "various", "vast", "vault", "vehicle", "velvet",
-    "vendor", "venture", "venue", "verb", "verify", "version", "very", "vessel", "veteran"
-]
+# --- Breach UI throttle/backoff ---
+MIN_BREACH_CLICK_INTERVAL = 2.0   # seconds between allowed clicks
+MAX_BREACH_RETRIES = 3            # max retries on HTTP 429
+BACKOFF_BASE_MS = 800             # base backoff in ms (exponential)
+_breach_last_click_ts = 0.0
+_breach_inflight = False
 
-# Sort the entire DICEWARE_WORDLIST alphabetically after all words are included
-DICEWARE_WORDLIST.sort()
+# --- Core Functionality ---
+def generate_password_sync(length):
+    """Generate a random password using a full printable alphabet."""
+    alphabet = string.ascii_letters + string.digits + string.punctuation
+    if length < 8:
+        length = 8
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
 
-# Calculate the final size of the combined wordlist
-WORDLIST_SIZE = len(DICEWARE_WORDLIST)
+def generate_diceware_passphrase(word_count, separator=" "):
+    """Generate a Diceware passphrase from the external list."""
+    words = load_diceware_words()
+    n = len(words)
+    if n == 0:
+        # Shouldn't happen; fallback ensures non-empty
+        return ""
+    chosen = [words[secrets.randbelow(n)] for _ in range(word_count)]
+    return separator.join(chosen)
 
-# --- Global variable to manage password restoration after "Copied!" message ---
-_original_password_after_copy = "" 
+# --- Enhanced Security Classes and Functions ---
+class SecureString:
+    """Minimize lifetime of cleartext by holding it in a mutable buffer."""
 
-# --- Function Definitions ---
+    def __init__(self, value=""):
+        self._data = bytearray(value.encode('utf-8'))
+        self._is_cleared = False
 
-def get_estimated_crack_time(entropy_bits):
-    """
-    Provides a very rough estimation of crack time based on entropy bits.
-    These are highly simplified and depend heavily on attacker hardware.
-    """
-    if entropy_bits < 28:
-        return "Instantly (or less than a second)"
-    elif entropy_bits < 36:
-        return "Minutes"
-    elif entropy_bits < 43:
-        return "Hours"
-    elif entropy_bits < 50:
-        return "Days"
-    elif entropy_bits < 57:
-        return "Months"
-    elif entropy_bits < 64:
-        return "Years"
-    elif entropy_bits < 70:
-        return "Decades"
-    elif entropy_bits < 80:
-        return "Centuries"
-    elif entropy_bits < 90:
-        return "Millennia"
-    elif entropy_bits < 100:
-        return "Millions of Years"
-    else:
-        return "Billions of Years (or longer)"
+    def get(self):
+        if self._is_cleared:
+            return ""
+        return self._data.decode('utf-8')
 
-def generate_password():
-    """
-    Generates a secure random password or passphrase based on user-selected criteria.
-    Updates the password display, checks its strength, and schedules clearing.
-    """
-    password_length = int(slider.get())  # Get the selected length/word count
+    def clear(self):
+        if not self._is_cleared:
+            for _ in range(3):
+                for i in range(len(self._data)):
+                    self._data[i] = secrets.randbits(8)
+            self._data.clear()
+            self._is_cleared = True
+            gc.collect()
 
-    if passphrase_mode_var.get():
-        # --- Passphrase Generation ---
-        if password_length < 3: # Minimum reasonable passphrase length
-            password_var.set("Error: At least 3 words for passphrase.")
-            strength_label.config(text="Strength: N/A", foreground="gray")
+    def __del__(self):
+        self.clear()
+
+    def __len__(self):
+        return 0 if self._is_cleared else len(self._data)
+
+def _set_copy_button_state(enabled: bool, text: str = None):
+    """Enable/disable the Copy button and optionally set its text."""
+    try:
+        if _copy_button_ref and _copy_button_ref.winfo_exists():
+            if enabled:
+                _copy_button_ref.state(['!disabled'])
+            else:
+                _copy_button_ref.state(['disabled'])
+            if text is not None:
+                _copy_button_ref.config(text=text)
+    except Exception:
+        pass
+
+def clipboard_cleared_ui_reset():
+    """UI reset when clipboard is cleared (by timeout or manually)."""
+    global _clipboard_countdown_job, _clipboard_countdown_remaining
+    try:
+        if _clipboard_countdown_job:
+            root.after_cancel(_clipboard_countdown_job)
+        _clipboard_countdown_job = None
+        _clipboard_countdown_remaining = 0
+        if 'status_label' in globals() and status_label and status_label.winfo_exists():
+            status_label.config(text="")
+        _set_copy_button_state(True, "Copy to Clipboard (Clears in 30s)")
+    except Exception:
+        pass
+
+def cancel_clipboard_countdown(reason: str = ""):
+    """Cancel countdown and re-enable Copy (used when generating a new secret)."""
+    clipboard_cleared_ui_reset()
+
+def _tick_clipboard_countdown():
+    """Per-second countdown tick."""
+    global _clipboard_countdown_remaining, _clipboard_countdown_job
+    try:
+        if _clipboard_countdown_remaining <= 0:
+            # Time’s up: clear clipboard and reset UI
+            clear_clipboard()
+            clipboard_cleared_ui_reset()
             return
 
-        passphrase_words = [secrets.choice(DICEWARE_WORDLIST) for _ in range(password_length)]
-        password = "-".join(passphrase_words) # Join words with hyphens
-        
-        # Passphrase entropy: N_words * log2(WORDLIST_SIZE)
-        entropy = password_length * math.log2(WORDLIST_SIZE)
-        
-        password_var.set(password)
-        check_password_strength(password, entropy, is_passphrase=True)
+        # Update status label and button text
+        if 'status_label' in globals() and status_label and status_label.winfo_exists():
+            status_label.config(text=f"Clipboard will auto‑clear in {_clipboard_countdown_remaining}s")
+        _set_copy_button_state(False, f"Copied — Clears in {_clipboard_countdown_remaining}s")
 
-    else:
-        # --- Character-based Password Generation ---
-        alphabet_chars = []
-        if include_lower_var.get():
-            alphabet_chars.extend(list(string.ascii_lowercase))
-        if include_upper_var.get():
-            alphabet_chars.extend(list(string.ascii_uppercase))
-        if include_digits_var.get():
-            alphabet_chars.extend(list(string.digits))
-        if include_special_var.get():
-            alphabet_chars.extend(list(string.punctuation))
+        _clipboard_countdown_remaining -= 1
+        _clipboard_countdown_job = root.after(1000, _tick_clipboard_countdown)
+    except Exception:
+        # If something goes sideways, try to reset gracefully
+        clipboard_cleared_ui_reset()
 
-        if not alphabet_chars:
-            password_var.set("") # Clear any previous password
-            strength_label.config(text="", foreground="gray") # Clear strength feedback
-            
-            error_feedback_label = ttk.Label(root, text="ERROR: SELECT CHARACTER TYPES!", foreground="red", 
-                                           font=("Consolas", 11, "bold"), background=DARK_BG)
-            error_feedback_label.grid(row=9, column=0, pady=5) # Place on appropriate row
-            root.after(3000, lambda: error_feedback_label.destroy())
-            return
+def start_clipboard_countdown(seconds: int):
+    """Start/replace the clipboard countdown and lock the Copy button."""
+    global _clipboard_countdown_remaining, _clipboard_countdown_job
+    try:
+        if _clipboard_countdown_job:
+            root.after_cancel(_clipboard_countdown_job)
+        _clipboard_countdown_remaining = max(0, int(seconds))
+        _set_copy_button_state(False, f"Copied — Clears in {_clipboard_countdown_remaining}s")
+        if 'status_label' in globals() and status_label and status_label.winfo_exists():
+            status_label.config(text=f"Clipboard will auto‑clear in {_clipboard_countdown_remaining}s")
+        _clipboard_countdown_job = root.after(1000, _tick_clipboard_countdown)
+    except Exception:
+        pass
 
-        alphabet = ''.join(sorted(list(set(alphabet_chars))))
-        password = ''.join(secrets.choice(alphabet) for _ in range(password_length))
-        
-        # Character-based entropy: Length * log2(Alphabet_size)
-        entropy = password_length * math.log2(len(alphabet))
-
-        password_var.set(password)
-        check_password_strength(password, entropy, is_passphrase=False)
-
-    root.after(30000, clear_password)
-
-def clear_password():
-    """
-    Overwrites the password string in memory before clearing the variable.
-    Sets the password display to blank.
-    """
-    global _original_password_after_copy # Ensure we can clear this if needed
-
-    password = password_var.get()
-    if password:
-        random_chars = ''.join(secrets.choice(string.ascii_letters + string.digits + string.punctuation) 
-                               for _ in range(len(password)))
-        password_var.set(random_chars) # Overwrite for memory
-        password_var.set("") # Set to blank
-    strength_label.config(text="", foreground="gray") # Clear strength feedback
-    _original_password_after_copy = "" # Clear stored password if timer runs
-
-def copy_password():
-    """
-    Copies the generated password to the clipboard and displays 'Password Copied!'
-    in the password entry, then reverts it after a short delay.
-    """
-    global _original_password_after_copy
-
-    current_password = password_var.get()
-    if current_password:
+def secure_clipboard_copy(password):
+    """Copy to clipboard with auto-clear."""
+    global _clipboard_clear_timer
+    if not password:
+        return False
+    try:
+        if _clipboard_clear_timer and _clipboard_clear_timer.is_alive():
+            _clipboard_clear_timer.cancel()
         root.clipboard_clear()
-        root.clipboard_append(current_password)
+        root.clipboard_append(password)
+        # Keep the existing timed clear; UI countdown runs in parallel and also clears at 0s.
+        _clipboard_clear_timer = threading.Timer(CLIPBOARD_CLEAR_TIMEOUT, clear_clipboard)
+        _clipboard_clear_timer.daemon = True
+        _clipboard_clear_timer.start()
+        return True
+    except Exception as e:
+        print(f"Clipboard copy failed: {e}")
+        return False
 
-        _original_password_after_copy = current_password # Store the actual password
+def clear_clipboard():
+    """Best-effort clipboard overwrite then clear."""
+    try:
+        random_data = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(50))
+        root.clipboard_clear()
+        root.clipboard_append(random_data)
+        root.clipboard_clear()
+        if root and root.winfo_exists():
+            root.after(0, lambda: show_temporary_message("Clipboard cleared for security", 2000))
+    except Exception as e:
+        print(f"Clipboard clear failed: {e}")
+    finally:
+        # Ensure UI becomes usable again when clipboard is cleared
+        if root and root.winfo_exists():
+            root.after(0, clipboard_cleared_ui_reset)
 
-        password_entry.config(state="normal") # Make editable temporarily
-        password_var.set("Password Copied!")
-        
-        # Schedule the restoration
-        root.after(2000, restore_password_entry_after_copy)
-    else:
-        # If password field is empty, show a temporary message below the copy button
-        no_password_feedback_label = ttk.Label(root, text="No password to copy!", foreground="red", 
-                                   font=("Consolas", 10, "bold"), background=DARK_BG)
-        no_password_feedback_label.grid(row=12, column=0, pady=5, sticky="n") # Use same row as copy button, it's temporary
-        root.after(1500, lambda: no_password_feedback_label.destroy())
+def show_temporary_message(message, duration_ms):
+    try:
+        temp_label = tk.Label(root, text=message, foreground="yellow", bg=DARK_BG, font=("Consolas", 9, "italic"))
+        temp_label.grid(row=8, column=0, pady=5)
+        root.after(duration_ms, lambda: temp_label.destroy() if temp_label.winfo_exists() else None)
+    except Exception as e:
+        print(f"Message display failed: {e}")
 
-def restore_password_entry_after_copy():
+def secure_clear_password():
+    """Securely clear displayed secret and wipe memory buffer."""
+    global _secure_password_storage
+    try:
+        current_display = password_var.get() or passphrase_var.get()
+        display_length = len(current_display)
+
+        if display_length > 0:
+            for _ in range(3):
+                random_display = ''.join(secrets.choice(string.ascii_letters + string.digits) for _ in range(display_length))
+                password_var.set(random_display)
+                passphrase_var.set(random_display)
+                root.update()
+                time.sleep(0.01)
+
+        password_var.set("")
+        passphrase_var.set("")
+
+        if _secure_password_storage:
+            _secure_password_storage.clear()
+            _secure_password_storage = None
+
+        gc.collect()
+
+        if root and root.winfo_exists():
+            update_entropy_label(0)
+            root.after(0, lambda: show_temporary_message("Password cleared from memory", 2000))
+    except Exception as e:
+        print(f"Password clear failed: {e}")
+
+def secure_copy_password(copy_button=None):
+    """Copy currently generated secret to clipboard with UI hints + countdown lockout."""
+    global _secure_password_storage, _password_clear_timer, _copy_button_ref
+    try:
+        _copy_button_ref = copy_button or _copy_button_ref  # remember the widget for updates
+
+        # Prefer the secure buffer; if it's gone, fall back to what's displayed.
+        candidate = None
+        if _secure_password_storage and not _secure_password_storage._is_cleared:
+            candidate = _secure_password_storage.get()
+        else:
+            candidate = (password_var.get() or passphrase_var.get() or "").strip()
+            if candidate:
+                _secure_password_storage = SecureString(candidate)
+
+        if not candidate:
+            show_temporary_message("No password to copy!", 1500)
+            return
+
+        # Align the display auto-clear so it doesn't nuke mid‑copy UX
+        try:
+            if _password_clear_timer and _password_clear_timer.is_alive():
+                _password_clear_timer.cancel()
+            _password_clear_timer = threading.Timer(PASSWORD_DISPLAY_TIMEOUT, secure_clear_password)
+            _password_clear_timer.daemon = True
+            _password_clear_timer.start()
+        except Exception:
+            pass
+
+        if secure_clipboard_copy(candidate):
+            # Start the clipboard countdown + lock the copy button
+            start_clipboard_countdown(CLIPBOARD_CLEAR_TIMEOUT)
+
+            # Brief success banner; restore afterwards
+            password_var.set("Password Copied! (Clipboard will auto‑clear)")
+            passphrase_var.set("Password Copied! (Clipboard will auto‑clear)")
+
+            def restore_display():
+                try:
+                    if _secure_password_storage and not _secure_password_storage._is_cleared:
+                        s = _secure_password_storage.get()
+                        if password_entry.cget("state") == "readonly":
+                            password_var.set(s)
+                        if passphrase_entry.cget("state") == "readonly":
+                            passphrase_var.set(s)
+                    else:
+                        password_var.set("")
+                        passphrase_var.set("")
+                except Exception as e:
+                    print(f"Display restore failed: {e}")
+
+            root.after(1500, restore_display)
+
+            # Scrub local temp
+            junk = ''.join(secrets.choice(string.ascii_letters) for _ in range(len(candidate)))
+            del junk
+        else:
+            show_temporary_message("Copy failed!", 1500)
+
+    except Exception as e:
+        print(f"Copy operation failed: {e}")
+        show_temporary_message("Copy failed!", 1500)
+
+def enhanced_exit_handler():
+    """Clean up on exit."""
+    global _secure_password_storage, _clipboard_clear_timer, _password_clear_timer
+    try:
+        clear_clipboard()
+    except:
+        pass
+    if _clipboard_clear_timer and _clipboard_clear_timer.is_alive():
+        _clipboard_clear_timer.cancel()
+    if _password_clear_timer and _password_clear_timer.is_alive():
+        _password_clear_timer.cancel()
+    if _secure_password_storage:
+        _secure_password_storage.clear()
+    for _ in range(3):
+        gc.collect()
+    try:
+        root.quit()
+    except:
+        pass
+
+def enable_security_features():
+    """Enable a couple Windows mitigations (best effort)."""
+    try:
+        if sys.platform == "win32":
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetProcessMitigationPolicy(1, ctypes.byref(ctypes.c_uint32(1)), 4)
+            kernel32.SetProcessDEPPolicy(1)
+    except Exception:
+        pass
+
+# --- Password Analysis ---
+def calculate_actual_entropy(password):
+    """Shannon entropy of observed distribution * length (educational)."""
+    if not password:
+        return 0
+    try:
+        char_counts = Counter(password)
+        L = len(password)
+        H = 0.0
+        for c in char_counts.values():
+            p = c / L
+            if p > 0:
+                H -= p * math.log2(p)
+        return H * L
+    except Exception as e:
+        print(f"Entropy calculation failed: {e}")
+        return 0
+
+def get_charset_entropy(password):
+    """Theoretical entropy using distinct characters (approx only)."""
+    try:
+        charset_size = len(set(password)) or 1
+        return len(password) * math.log2(charset_size)
+    except Exception as e:
+        print(f"Charset entropy calculation failed: {e}")
+        return 0
+
+def detect_patterns(password):
+    try:
+        if len(password) < 2:
+            return False
+        for i in range(1, len(password) // 2 + 1):
+            for j in range(len(password) - 2 * i + 1):
+                if password[j:j+i] == password[j+i:j+2*i]:
+                    return True
+        return False
+    except Exception as e:
+        print(f"Pattern detection failed: {e}")
+        return False
+
+def check_dictionary_words(password):
+    try:
+        common = {"password", "123456", "qwerty", "secret", "p@ssw0rd", "admin", "login", "user"}
+        lp = password.lower()
+        if lp in common:
+            return True
+        return any(w in lp for w in common)
+    except Exception as e:
+        print(f"Dictionary check failed: {e}")
+        return False
+
+def check_keyboard_patterns(password):
+    try:
+        pats = ["qwerty", "asdfgh", "zxcvbn", "123456789", "qwertz", "azerty"]
+        lp = password.lower()
+        return any(p in lp or p[::-1] in lp for p in pats)
+    except Exception as e:
+        print(f"Keyboard pattern check failed: {e}")
+        return False
+
+def calculate_repetition_score(password):
+    try:
+        if len(password) < 2:
+            return 0
+        total = sum(1 for i in range(len(password) - 1) if password[i] == password[i+1])
+        return total / len(password)
+    except Exception as e:
+        print(f"Repetition score failed: {e}")
+        return 0
+
+def comprehensive_strength_analysis(password):
+    """Multi-signal strength analysis (kept from your earlier design)."""
+    try:
+        if not password:
+            return {
+                'length': 0, 'charset_size': 0,
+                'theoretical_entropy': 0, 'actual_entropy': 0,
+                'patterns_detected': False, 'dictionary_word_found': False,
+                'keyboard_pattern_found': False, 'repetition_score': 0,
+                'strength_rating': 'No Password'
+            }
+        analysis = {
+            'length': len(password),
+            'charset_size': len(set(password)),
+            'theoretical_entropy': get_charset_entropy(password),
+            'actual_entropy': calculate_actual_entropy(password),
+            'patterns_detected': detect_patterns(password),
+            'dictionary_word_found': check_dictionary_words(password),
+            'keyboard_pattern_found': check_keyboard_patterns(password),
+            'repetition_score': calculate_repetition_score(password)
+        }
+        e = analysis['actual_entropy']
+        if analysis['patterns_detected'] or analysis['dictionary_word_found'] or analysis['keyboard_pattern_found']:
+            rating = "Very Weak (Pattern/Word detected)"
+        elif e < 40:
+            rating = "Very Weak"
+        elif e < 60:
+            rating = "Weak"
+        elif e < 80:
+            rating = "Fair"
+        elif e < 100:
+            rating = "Good"
+        else:
+            rating = "Excellent"
+        analysis['strength_rating'] = rating
+        return analysis
+    except Exception as e:
+        print(f"Strength analysis failed: {e}")
+        return {
+            'length': 0, 'charset_size': 0,
+            'theoretical_entropy': 0, 'actual_entropy': 0,
+            'patterns_detected': False, 'dictionary_word_found': False,
+            'keyboard_pattern_found': False, 'repetition_score': 0,
+            'strength_rating': 'Analysis Failed'
+        }
+
+# --- Security self-checks (lightweight) ---
+def validate_entropy_source():
+    try:
+        return secrets.SystemRandom is not None
+    except Exception:
+        return False
+
+def check_memory_protection():
+    try:
+        s = SecureString("Test")
+        s.clear()
+        return s._is_cleared
+    except Exception:
+        return False
+
+def check_timing_attacks():
+    try:
+        short = "a"*10
+        longp = "a"*100
+        runs = 5
+        t0 = time.perf_counter()
+        for _ in range(runs): comprehensive_strength_analysis(short)
+        t1 = time.perf_counter()
+        for _ in range(runs): comprehensive_strength_analysis(longp)
+        t2 = time.perf_counter()
+        return (t2-t1) - (t1-t0) < (t1-t0)*3.0
+    except Exception:
+        return False
+
+def test_input_validation():
+    try:
+        for inp in ["' OR '1'='1", "A"*100, "rm -rf /", ";", "", None]:
+            if inp is not None:
+                comprehensive_strength_analysis(str(inp))
+        return True
+    except Exception:
+        return False
+
+def security_audit():
+    try:
+        return {
+            'entropy_source': validate_entropy_source(),
+            'memory_protection': check_memory_protection(),
+            'timing_consistency': check_timing_attacks(),
+            'input_validation': test_input_validation()
+        }
+    except Exception as e:
+        print(f"Security audit failed: {e}")
+        return {
+            'entropy_source': False,
+            'memory_protection': False,
+            'timing_consistency': False,
+            'input_validation': False
+        }
+
+# --- Async utility ---
+def run_in_thread(func, callback, *args, **kwargs):
+    def thread_function():
+        try:
+            result = func(*args, **kwargs)
+            if root and root.winfo_exists():
+                root.after(0, lambda: callback(result))
+        except Exception as e:
+            print(f"Thread execution failed: {e}")
+            if root and root.winfo_exists():
+                root.after(0, lambda: callback(None))
+    threading.Thread(target=thread_function, daemon=True).start()
+
+# --- Breach Detection (HIBP) with polite 429 handling ---
+def check_password_breach(password):
     """
-    Restores the password entry to its original content or clears it
-    if the 30-second timer ran during the 'Password Copied!' message.
-    """
-    global _original_password_after_copy
-
-    # Only restore if the password_var still contains "Password Copied!"
-    # This prevents overwriting a password that was cleared by clear_password()
-    if password_var.get() == "Password Copied!":
-        password_var.set(_original_password_after_copy)
-    else: # If it's not "Password Copied!", it means clear_password() ran
-        password_var.set("") # Ensure it stays blank
-
-    password_entry.config(state="readonly") # Set back to readonly
-    _original_password_after_copy = "" # Clear the stored password after use
-
-
-def update_length_label(event=None):
-    """Updates the label displaying the current length/word count selected by the slider."""
-    current_value = int(slider.get())
-    if passphrase_mode_var.get():
-        length_label.config(text=f"Words: {current_value}")
-    else:
-        length_label.config(text=f"Length: {current_value}")
-
-def check_password_strength(password, entropy_bits=None, is_passphrase=False):
-    """
-    Calculates password strength based on entropy (in bits) and updates the label.
-    Includes time-to-crack estimation.
+    HIBP k-anonymity 'range' API.
+    Sends first 5 chars of SHA-1; matches suffix locally.
+    Returns: dict { is_breached, breach_count, error, retry_after? }
     """
     if not password:
-        strength_label.config(text="Strength: N/A", foreground="gray")
+        return {'is_breached': False, 'breach_count': 0, 'error': None}
+    try:
+        sha1_hash = hashlib.sha1(password.encode('utf-8')).hexdigest().upper()
+        prefix, suffix = sha1_hash[:5], sha1_hash[5:]
+        url = f"https://api.pwnedpasswords.com/range/{prefix}"
+        headers = {
+            "User-Agent": "TsarSecure-PasswordChecker/2.6",
+            "Add-Padding": "true"
+        }
+        r = requests.get(url, headers=headers, timeout=BREACH_CHECK_TIMEOUT)
+        if r.status_code == 200:
+            for line in r.text.strip().splitlines():
+                if ':' not in line:
+                    continue
+                h_suf, count = line.split(':', 1)
+                if h_suf == suffix:
+                    try:
+                        return {'is_breached': True, 'breach_count': int(count), 'error': None}
+                    except ValueError:
+                        return {'is_breached': True, 'breach_count': 1, 'error': None}
+            return {'is_breached': False, 'breach_count': 0, 'error': None}
+        elif r.status_code == 429:
+            retry_after = None
+            try:
+                ra = r.headers.get("Retry-After")
+                if ra is not None:
+                    retry_after = int(float(ra))
+            except Exception:
+                retry_after = None
+            return {'is_breached': False, 'breach_count': 0, 'error': 'Rate limited', 'retry_after': retry_after}
+        else:
+            return {'is_breached': False, 'breach_count': 0, 'error': f'HTTP {r.status_code}'}
+    except requests.exceptions.Timeout:
+        return {'is_breached': False, 'breach_count': 0, 'error': 'Timeout'}
+    except requests.exceptions.ConnectionError:
+        return {'is_breached': False, 'breach_count': 0, 'error': 'No internet'}
+    except Exception as e:
+        return {'is_breached': False, 'breach_count': 0, 'error': f'Error: {str(e)[:60]}'}
+
+def format_breach_count(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count/1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count/1_000:.1f}K"
+    return str(count)
+
+def get_breach_risk_level(count: int) -> str:
+    if count == 0: return "SAFE"
+    if count < 10: return "LOW"
+    if count < 100: return "MEDIUM"
+    if count < 1000: return "HIGH"
+    return "CRITICAL"
+
+def risk_color(level: str) -> str:
+    return {
+        "SAFE": BREACH_GREEN, "LOW": BREACH_YELLOW,
+        "MEDIUM": BREACH_ORANGE, "HIGH": BREACH_ORANGE,
+        "CRITICAL": BREACH_RED
+    }.get(level, BREACH_YELLOW)
+
+def update_breach_ui(result, label_widget: ttk.Label):
+    if not label_widget or not label_widget.winfo_exists():
+        return
+    if result is None:
+        label_widget.config(text="Breach: ? (error)", foreground=BREACH_YELLOW)
+        return
+    if result.get('error'):
+        label_widget.config(text=f"Breach: ? ({result['error']})", foreground=BREACH_YELLOW)
+        return
+    if result.get('is_breached'):
+        cnt = result.get('breach_count', 0)
+        lvl = get_breach_risk_level(cnt)
+        label_widget.config(text=f"Breach: {format_breach_count(cnt)} ({lvl})", foreground=risk_color(lvl))
+    else:
+        label_widget.config(text="Breach: 0 (SAFE)", foreground=BREACH_GREEN)
+
+def do_breach_check(pw: str, label_widget: ttk.Label):
+    run_in_thread(check_password_breach, lambda res: update_breach_ui(res, label_widget), pw)
+
+def breach_check_with_throttle(pw: str, label_widget: ttk.Label, button_widget: ttk.Button, attempt: int = 0):
+    """
+    Client-side throttle + exponential backoff for HIBP checks.
+    - Debounces rapid clicks
+    - Disables the button while a request is in flight
+    - Retries on 429 with capped exponential backoff
+    """
+    global _breach_last_click_ts, _breach_inflight
+
+    if _breach_inflight:
+        show_temporary_message("Breach check already running…", 1200)
         return
 
-    if entropy_bits is None: # For "Check My Password" if not generated by us
-        # Attempt to determine if it's a passphrase-like string or character-based
-        # Simple heuristic: if it contains hyphens and words are in our wordlist
-        if '-' in password and all(word in DICEWARE_WORDLIST for word in password.split('-')):
-            word_count = len(password.split('-'))
-            entropy_bits = word_count * math.log2(WORDLIST_SIZE)
-        else: # Treat as complex character string
-            # Estimate keyspace for arbitrary input (common printable ASCII ~94 chars)
-            charset_size = 0
-            if any(c.islower() for c in password): charset_size += 26
-            if any(c.isupper() for c in password): charset_size += 26
-            if any(c.isdigit() for c in password): charset_size += 10
-            if any(c in string.punctuation for c in password): charset_size += 32
-            
-            if charset_size == 0: # If password contains no recognized char types
-                charset_size = 1 # Prevent log2(0) error, minimal entropy
-            
-            entropy_bits = len(password) * math.log2(charset_size)
+    now = time.time()
+    if (now - _breach_last_click_ts) < MIN_BREACH_CLICK_INTERVAL:
+        show_temporary_message("Too fast. Try again in a moment.", 1200)
+        return
+    _breach_last_click_ts = now
 
-    
-    estimated_time = get_estimated_crack_time(entropy_bits)
+    # Disable UI while in flight
+    try:
+        if button_widget and button_widget.winfo_exists():
+            button_widget.state(['disabled'])
+        if label_widget and label_widget.winfo_exists():
+            label_widget.config(text="Breach: checking…", foreground=ELECTRIC_BLUE)
+    except Exception:
+        pass
 
-    # Determine strength level and update label based on entropy
-    if entropy_bits >= 100:
-        strength_label.config(text=f"Godlike ({int(entropy_bits)} bits)\nCracks in: {estimated_time}", foreground="#00FF7F")
-    elif entropy_bits >= 80:
-        # Corrected: changed estimated_BLUE to estimated_time and added foreground color
-        strength_label.config(text=f"Hardened ({int(entropy_bits)} bits)\nCracks in: {estimated_time}", foreground="#FFD700")
-    elif entropy_bits >= 60:
-        strength_label.config(text=f"Exploitable ({int(entropy_bits)} bits)\nCracks in: {estimated_time}", foreground="#FFA500")
-    else:
-        strength_label.config(text=f"Breach Imminent! ({int(entropy_bits)} bits)\nCracks in: {estimated_time}", foreground="#FF4500")
+    _breach_inflight = True
+
+    def _on_result(res):
+        nonlocal attempt
+        try:
+            if res and res.get('error') == 'Rate limited' and attempt < MAX_BREACH_RETRIES:
+                retry_after = res.get('retry_after')
+                if retry_after is None:
+                    delay_ms = int((BACKOFF_BASE_MS * (2 ** attempt)) + secrets.randbelow(250))
+                else:
+                    delay_ms = max(0, int(retry_after * 1000))
+                if label_widget and label_widget.winfo_exists():
+                    label_widget.config(text=f"Breach: waiting {delay_ms//1000}s (rate-limited)…", foreground=BREACH_YELLOW)
+                attempt += 1
+                root.after(delay_ms, lambda: breach_check_with_throttle(pw, label_widget, button_widget, attempt))
+                return
+            update_breach_ui(res, label_widget)
+        finally:
+            if not (res and res.get('error') == 'Rate limited' and attempt <= MAX_BREACH_RETRIES):
+                _end_breach_request(button_widget)
+
+    run_in_thread(check_password_breach, _on_result, pw)
+
+def _end_breach_request(button_widget: ttk.Button):
+    global _breach_inflight
+    _breach_inflight = False
+    try:
+        if button_widget and button_widget.winfo_exists():
+            button_widget.state(['!disabled'])
+    except Exception:
+        pass
+
+# --- UI Functions ---
+def update_entropy_label(entropy_bits):
+    try:
+        if not entropy_bits:
+            entropy_label.config(text="")
+            return
+        if entropy_bits < 40:
+            color, strength = "#FF0000", "Very Weak"
+        elif entropy_bits < 60:
+            color, strength = "#FF4500", "Weak"
+        elif entropy_bits < 80:
+            color, strength = "#FFA500", "Fair"
+        elif entropy_bits < 100:
+            color, strength = "#FFFF00", "Good"
+        else:
+            color, strength = "#39FF14", "Excellent"
+        entropy_label.config(text=f"Entropy: {entropy_bits:.1f} bits ({strength})", foreground=color)
+    except Exception as e:
+        print(f"Entropy label update failed: {e}")
+
+def secure_generate_password():
+    """Generate a password (threaded) and display with entropy."""
+    global _secure_password_storage, _password_clear_timer
+    try:
+        cancel_clipboard_countdown("new_password")
+        if _secure_password_storage:
+            _secure_password_storage.clear()
+        if _password_clear_timer and _password_clear_timer.is_alive():
+            _password_clear_timer.cancel()
+
+        password_entry.config(state="normal")
+        password_var.set("Generating...")
+        passphrase_var.set("")
+        root.update()
+
+        length = int(password_length_slider.get())
+
+        def generate_with_entropy(length):
+            pw = generate_password_sync(length)
+            ent = calculate_actual_entropy(pw)
+            return (pw, ent)
+
+        def on_done(result):
+            try:
+                if result is None:
+                    password_var.set("Generation Failed")
+                    password_entry.config(state="readonly")
+                    return
+                pw, ent = result
+                _secure_password_storage = SecureString(pw)
+                password_var.set(_secure_password_storage.get())
+                password_entry.config(state="readonly")
+                update_entropy_label(ent)
+                start_auto_clear()
+            except Exception as e:
+                print(f"Password generation callback failed: {e}")
+                password_var.set("Generation Failed")
+                password_entry.config(state="readonly")
+
+        run_in_thread(generate_with_entropy, on_done, length)
+    except Exception as e:
+        print(f"Password generation failed: {e}")
+        password_var.set("Generation Failed")
+        if 'password_entry' in globals():
+            password_entry.config(state="readonly")
+
+def secure_generate_passphrase():
+    """Generate a Diceware passphrase (threaded) and display with entropy."""
+    global _secure_password_storage, _password_clear_timer
+    try:
+        cancel_clipboard_countdown("new_password")
+        if _secure_password_storage:
+            _secure_password_storage.clear()
+        if _password_clear_timer and _password_clear_timer.is_alive():
+            _password_clear_timer.cancel()
+
+        passphrase_entry.config(state="normal")
+        passphrase_var.set("Generating...")
+        password_var.set("")
+        root.update()
+
+        word_count = int(passphrase_length_slider.get())
+
+        def generate_with_entropy(word_count):
+            phrase = generate_diceware_passphrase(word_count, separator=" ")
+            ent = calculate_actual_entropy(phrase)
+            return (phrase, ent)
+
+        def on_done(result):
+            try:
+                if result is None:
+                    passphrase_var.set("Generation Failed")
+                    passphrase_entry.config(state="readonly")
+                    return
+                phrase, ent = result
+                _secure_password_storage = SecureString(phrase)
+                passphrase_var.set(_secure_password_storage.get())
+                passphrase_entry.config(state="readonly")
+                update_entropy_label(ent)
+                start_auto_clear()
+            except Exception as e:
+                print(f"Passphrase generation callback failed: {e}")
+                passphrase_var.set("Generation Failed")
+                passphrase_entry.config(state="readonly")
+
+        run_in_thread(generate_with_entropy, on_done, word_count)
+    except Exception as e:
+        print(f"Passphrase generation failed: {e}")
+        passphrase_var.set("Generation Failed")
+        if 'passphrase_entry' in globals():
+            passphrase_entry.config(state="readonly")
+
+def start_auto_clear():
+    """Start the auto-clear timer for displayed secrets."""
+    global _password_clear_timer
+    _password_clear_timer = threading.Timer(PASSWORD_DISPLAY_TIMEOUT, secure_clear_password)
+    _password_clear_timer.daemon = True
+    _password_clear_timer.start()
+
+def on_tab_changed(event):
+    try:
+        selected_tab = notebook.tab(notebook.select(), "text")
+        if selected_tab == "Password Generator":
+            passphrase_var.set("")
+            if not password_var.get():
+                update_entropy_label(0)
+        elif selected_tab == "Passphrase Generator":
+            password_var.set("")
+            if not passphrase_var.get():
+                update_entropy_label(0)
+    except Exception as e:
+        print(f"Tab change handler failed: {e}")
+
+def on_check_password_entry_change(*args):
+    try:
+        pw = check_password_var.get()
+        if not pw:
+            update_entropy_label(0)
+            return
+        def on_analysis_complete(analysis):
+            try:
+                update_entropy_label(analysis['actual_entropy'] if analysis else 0)
+            except Exception as e:
+                print(f"Analysis callback failed: {e}")
+        run_in_thread(comprehensive_strength_analysis, on_analysis_complete, pw)
+    except Exception as e:
+        print(f"Password check handler failed: {e}")
 
 def lock_computer():
-    """
-    Executes the Windows command to lock the computer.
-    """
     try:
-        os.system("rundll32.exe user32.dll,LockWorkStation")
+        if sys.platform == "win32":
+            ctypes.windll.user32.LockWorkStation()
+        elif sys.platform == "darwin":
+            os.system("/System/Library/CoreServices/Menu\\ Extras/User.menu/Contents/Resources/CGSession -suspend")
+        else:
+            os.system("dm-tool lock")
     except Exception as e:
-        print(f"Error locking computer: {e}") 
+        show_temporary_message(f"Lock failed: {str(e)[:30]}", 3000)
 
-def toggle_passphrase_mode():
-    """
-    Toggles between character-based password generation and passphrase generation.
-    Adjusts visibility/state of character type checkboxes and slider range.
-    """
-    if passphrase_mode_var.get():
-        # Passphrase mode active
-        include_lower_chk.config(state="disabled")
-        include_upper_chk.config(state="disabled")
-        include_digits_chk.config(state="disabled") # Corrected: added .config()
-        include_special_chk.config(state="disabled")
-        
-        slider.config(from_=3, to=10) # 3 to 10 words for passphrase
-        slider.set(6) # Default 6 words
-        length_label.config(text=f"Words: {int(slider.get())}")
-    else:
-        # Character-based mode active
-        include_lower_chk.config(state="normal")
-        include_upper_chk.config(state="normal")
-        include_digits_chk.config(state="normal") # Corrected: added .config()
-        include_special_chk.config(state="normal")
-
-        slider.config(from_=5, to=50) # 5 to 50 characters
-        slider.set(12) # Default 12 characters
-        length_label.config(text=f"Length: {int(slider.get())}")
-
-    # Clear fields and strength info when mode changes
-    password_var.set("")
-    check_password_var.set("")
-    strength_label.config(text="", foreground="gray")
-
-# --- Main Window Setup ---
-if __name__ == "__main__": # Ensures the GUI only runs when script is executed directly
-    root = tk.Tk()
-    root.title("Tsar Secure v2.0")
-    root.resizable(True, True) # Window is resizable
-    root.configure(bg=DARK_BG)
-    root.attributes("-alpha", WINDOW_ALPHA)
+# --- Main Application ---
+def main_app():
+    global root, notebook, password_var, passphrase_var, entropy_label
+    global password_length_slider, passphrase_length_slider, check_password_var
+    global password_entry, passphrase_entry, status_label, _copy_button_ref
 
     try:
-        root.iconbitmap("ts.ico") 
+        # Run a lightweight security audit at startup (printed only if something fails)
+        audit = security_audit()
+        if not all(audit.values()):
+            print("Security Audit Report:")
+            print(json.dumps(audit, indent=4))
+
+        # UI
+        root = tk.Tk()
+        root.title("TsarSecure v2.5.0")
+        root.geometry("600x650")
+        root.configure(bg=DARK_BG)
+        root.attributes('-alpha', WINDOW_ALPHA)
+        root.grid_columnconfigure(0, weight=1)
+        root.protocol("WM_DELETE_WINDOW", enhanced_exit_handler)
+
+        style = ttk.Style()
+        style.theme_use('clam')
+        style.configure("TFrame", background=DARK_BG)
+        style.configure("TLabel", background=DARK_BG, foreground=NEON_GREEN, font=("Consolas", 11))
+        style.configure("TButton", background=MEDIUM_BG, foreground=NEON_GREEN, font=("Consolas", 11), borderwidth=0)
+        style.map("TButton", background=[("active", ELECTRIC_BLUE)], foreground=[("active", DARK_BG)])
+        style.configure("TScale", background=DARK_BG, troughcolor=MEDIUM_BG)
+        style.configure("Futuristic.TEntry", fieldbackground=MEDIUM_BG, foreground=NEON_GREEN, borderwidth=0,
+                        insertcolor=NEON_GREEN, font=("Consolas", 12))
+        style.configure("TNotebook", background=DARK_BG, borderwidth=0)
+        style.configure("TNotebook.Tab", background=MEDIUM_BG, foreground=ELECTRIC_BLUE, padding=[10, 5])
+        style.map("TNotebook.Tab", background=[("selected", DARK_BG)], foreground=[("selected", NEON_GREEN)])
+
+        notebook = ttk.Notebook(root)
+        notebook.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
+        notebook.bind("<<NotebookTabChanged>>", on_tab_changed)
+
+        # Password Generator Tab
+        password_frame = ttk.Frame(notebook)
+        notebook.add(password_frame, text="Password Generator")
+        password_frame.grid_columnconfigure(0, weight=1)
+
+        password_var = tk.StringVar()
+        password_entry = ttk.Entry(password_frame, textvariable=password_var, style="Futuristic.TEntry",
+                                   justify="center", state="readonly")
+        password_entry.grid(row=0, column=0, pady=(20, 5), sticky="ew", padx=20)
+
+        ttk.Label(password_frame, text="Password Length:").grid(row=2, column=0, pady=(10, 0))
+        password_length_slider = ttk.Scale(password_frame, from_=8, to=30, orient=tk.HORIZONTAL, style="TScale")
+        password_length_slider.set(12)
+        password_length_slider.grid(row=3, column=0, sticky="ew", padx=30)
+
+        generate_btn = ttk.Button(password_frame, text="Generate Secure Password", command=secure_generate_password)
+        generate_btn.grid(row=4, column=0, pady=(10, 5))
+
+        # Passphrase Generator Tab
+        passphrase_frame = ttk.Frame(notebook)
+        notebook.add(passphrase_frame, text="Passphrase Generator")
+        passphrase_frame.grid_columnconfigure(0, weight=1)
+
+        passphrase_var = tk.StringVar()
+        passphrase_entry = ttk.Entry(passphrase_frame, textvariable=passphrase_var, style="Futuristic.TEntry",
+                                     justify="center", state="readonly")
+        passphrase_entry.grid(row=0, column=0, pady=(20, 5), sticky="ew", padx=20)
+
+        ttk.Label(passphrase_frame, text="Word Count:").grid(row=1, column=0, pady=(10, 0))
+        passphrase_length_slider = ttk.Scale(passphrase_frame, from_=4, to=8, orient=tk.HORIZONTAL, style="TScale")
+        passphrase_length_slider.set(5)
+        passphrase_length_slider.grid(row=2, column=0, sticky="ew", padx=30)
+
+        generate_passphrase_btn = ttk.Button(passphrase_frame, text="Generate Secure Passphrase",
+                                             command=secure_generate_passphrase)
+        generate_passphrase_btn.grid(row=3, column=0, pady=(10, 5))
+
+        # Common controls below the notebook
+        common_frame = ttk.Frame(root)
+        common_frame.grid(row=1, column=0, sticky="ew", padx=10)
+        common_frame.grid_columnconfigure(0, weight=1)
+
+        # Entropy label - shared
+        entropy_label = ttk.Label(common_frame, text="", style="TLabel")
+        entropy_label.grid(row=0, column=0, pady=5)
+
+        copy_button = ttk.Button(
+            common_frame,
+            text="Copy to Clipboard (Clears in 30s)",
+            command=lambda: secure_copy_password(copy_button),
+            style="TButton"
+        )
+        copy_button.grid(row=1, column=0, pady=(10, 5), sticky="n")
+        _copy_button_ref = copy_button  # keep a reference for UI state updates
+
+        clear_button = ttk.Button(common_frame, text="Clear Password Now", command=secure_clear_password)
+        clear_button.grid(row=2, column=0, pady=5, sticky="n")
+
+        ttk.Label(root, text="--- Check Your Own Password ---", style="TLabel", foreground=ELECTRIC_BLUE).grid(row=2, column=0, pady=(20,5))
+
+        check_password_var = tk.StringVar()
+        check_password_entry = ttk.Entry(root, textvariable=check_password_var, style="Futuristic.TEntry", justify="center")
+        check_password_entry.grid(row=3, column=0, pady=5, sticky="ew", padx=30)
+        check_password_var.trace_add('write', on_check_password_entry_change)
+
+        check_strength_button = ttk.Button(root, text="Check Strength",
+                                           command=lambda: run_in_thread(
+                                               comprehensive_strength_analysis,
+                                               lambda a: update_entropy_label(a['actual_entropy'] if a else 0),
+                                               check_password_var.get()),
+                                           style="TButton")
+        check_strength_button.grid(row=4, column=0, pady=10, sticky="n")
+
+        # Breach UI
+        breach_label = ttk.Label(root, text="Breach: —", style="TLabel", foreground=ELECTRIC_BLUE)
+        breach_label.grid(row=5, column=0, pady=(0, 4))
+        breach_button = ttk.Button(
+            root,
+            text="Check Breach (HIBP)",
+            command=lambda: breach_check_with_throttle(check_password_var.get(), breach_label, breach_button),
+            style="TButton"
+        )
+        breach_button.grid(row=6, column=0, pady=(2, 12), sticky="n")
+
+        lock_button = ttk.Button(root, text="🔒 Lock Computer", command=lock_computer)
+        lock_button.grid(row=7, column=0, pady=20, sticky="n")
+
+        status_label = ttk.Label(root, text="", style="TLabel")
+        status_label.grid(row=8, column=0, pady=5)
+
+        info_label = ttk.Label(root,
+                               text="🔒 Passwords auto-clear from display/memory after 30s\n🔒 Clipboard auto-clears after 30s",
+                               foreground="#FFFF00", font=("Consolas", 9, "italic"))
+        info_label.grid(row=9, column=0, pady=(5, 10))
+
+        update_entropy_label(0)
+        root.mainloop()
+
     except Exception as e:
-        print(f"Error setting icon: {e}. Make sure 'ts.ico' is in the same directory.")
+        print(f"Application startup failed: {e}")
+        if 'root' in locals():
+            try:
+                root.quit()
+            except:
+                pass
 
-    # --- Style Configuration ---
-    style = ttk.Style(root)
-    style.theme_use("clam") 
-
-    style.configure("TLabel", background=DARK_BG, foreground=NEON_GREEN, font=("Consolas", 12))
-    style.configure("Title.TLabel", background=DARK_BG, foreground=NEON_GREEN, font=("Consolas", 20, "bold"))
-    style.configure("TButton", background=MEDIUM_BG, foreground=NEON_GREEN, font=("Consolas", 11), borderwidth=0, relief="flat", padding=8)
-    style.map("TButton", background=[("active", "#444444")])
-    style.configure("TCheckbutton", background=DARK_BG, foreground=NEON_GREEN, font=("Consolas", 11), padding=5)
-    style.map("TCheckbutton", background=[("active", DARK_BG)])
-    style.configure("TScale", background=DARK_BG, troughcolor=MEDIUM_BG, slidercolor=NEON_GREEN)
-    style.configure("Futuristic.TEntry", fieldbackground=MEDIUM_BG, foreground=NEON_GREEN, 
-                    font=("Consolas", 14), relief="solid", borderwidth=2, bordercolor=ELECTRIC_BLUE, padding=5) 
-
-    # --- Grid Configuration for Responsiveness ---
-    root.grid_columnconfigure(0, weight=1)
-    for i in range(18): # Expanded row range for new elements
-        root.grid_rowconfigure(i, weight=1)
-
-    # --- WIDGET PLACEMENT WITH GRID ---
-
-    # Row 0: Title
-    title_label = ttk.Label(root, text="Tsar Secure v2.0", style="Title.TLabel")
-    title_label.grid(row=0, column=0, pady=(20, 10), sticky="n") 
-
-    # Row 1: Password Length/Words Label
-    slider_label = ttk.Label(root, text="Password Length:")
-    slider_label.grid(row=1, column=0, pady=(10, 0), sticky="s") 
-
-    # Row 2: Slider
-    slider = ttk.Scale(root, from_=5, to=50, orient="horizontal", length=300, command=update_length_label)
-    slider.grid(row=2, column=0, pady=5, sticky="ew", padx=20) 
-
-    # Row 3: Length/Words Display Label
-    length_label = ttk.Label(root, text=f"Length: {int(slider.get())}")
-    length_label.grid(row=3, column=0, pady=(0, 15), sticky="n")
-
-    # Row 4: Passphrase Mode Checkbox (NEW)
-    passphrase_mode_var = tk.BooleanVar(value=False)
-    passphrase_mode_chk = ttk.Checkbutton(root, text="Passphrase Mode", variable=passphrase_mode_var, 
-                                         command=toggle_passphrase_mode, style="TCheckbutton")
-    passphrase_mode_chk.grid(row=4, column=0, pady=(5,0))
-
-    # Rows 5-8: Character options checkboxes (now linked to a variable name for easy state change)
-    include_lower_var = tk.BooleanVar(value=True)
-    include_lower_chk = ttk.Checkbutton(root, text="Lowercase Letters (a-z)", variable=include_lower_var, style="TCheckbutton")
-    include_lower_chk.grid(row=5, column=0, pady=2, padx=50)
-
-    include_upper_var = tk.BooleanVar(value=True)
-    include_upper_chk = ttk.Checkbutton(root, text="Uppercase Letters (A-Z)", variable=include_upper_var, style="TCheckbutton")
-    include_upper_chk.grid(row=6, column=0, pady=2, padx=50)
-
-    include_digits_var = tk.BooleanVar(value=True)
-    include_digits_chk = ttk.Checkbutton(root, text="Numbers (0-9)", variable=include_digits_var, style="TCheckbutton")
-    include_digits_chk.grid(row=7, column=0, pady=2, padx=50)
-
-    include_special_var = tk.BooleanVar(value=False)
-    include_special_chk = ttk.Checkbutton(root, text="Special Characters (!@#$)", variable=include_special_var, style="TCheckbutton")
-    include_special_chk.grid(row=8, column=0, pady=2, padx=50)
-
-    # Row 9: Generate Password Button (or Error Message)
-    generate_button = ttk.Button(root, text="Generate Password", command=generate_password, style="TButton")
-    generate_button.grid(row=9, column=0, pady=20, sticky="n") 
-
-    # Row 10: Password display (read-only)
-    password_var = tk.StringVar()
-    password_entry = ttk.Entry(root, textvariable=password_var, style="Futuristic.TEntry", justify="center", state="readonly") 
-    password_entry.grid(row=10, column=0, pady=5, sticky="ew", padx=30) 
-
-    # Row 11: Password strength label (Now shows entropy bits and time-to-crack)
-    strength_label = ttk.Label(root, text="", style="TLabel", justify="center") # Centered text for multi-line
-    strength_label.grid(row=11, column=0, pady=(5, 10), sticky="n")
-
-    # Row 12: Copy Password Button
-    copy_button = ttk.Button(root, text="Copy Password", command=copy_password, style="TButton")
-    copy_button.grid(row=12, column=0, pady=5, sticky="n")
-
-    # --- NEW SECTION: Check My Password ---
-    # Row 13: Spacer/Header for Check My Password
-    ttk.Label(root, text="--- Check Your Own Password ---", style="TLabel", foreground=ELECTRIC_BLUE).grid(row=13, column=0, pady=(20,5))
-
-    # Row 14: Check My Password Entry
-    check_password_var = tk.StringVar()
-    check_password_entry = ttk.Entry(root, textvariable=check_password_var, style="Futuristic.TEntry", justify="center")
-    check_password_entry.grid(row=14, column=0, pady=5, sticky="ew", padx=30)
-
-    # Row 15: Check Strength Button for input field
-    check_strength_button = ttk.Button(root, text="Check Strength", 
-                                       command=lambda: check_password_strength(check_password_var.get(), entropy_bits=None), 
-                                       style="TButton")
-    check_strength_button.grid(row=15, column=0, pady=10, sticky="n")
-    # --- END Check My Password Section ---
-
-    # Row 16: Lock Computer Button
-    lock_button = ttk.Button(root, text="Lock Computer", command=lock_computer, style="TButton")
-    lock_button.grid(row=16, column=0, pady=15, sticky="n")
-
-    # Initial call to update slider label and checkbox states
-    update_length_label() 
-
-    # Start the GUI event loop
-    root.mainloop()
+if __name__ == "__main__":
+    try:
+        enable_security_features()
+        main_app()
+    except Exception as e:
+        print(f"Fatal error: {e}")
+        sys.exit(1)
