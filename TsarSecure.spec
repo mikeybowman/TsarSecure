@@ -1,32 +1,15 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 from PyInstaller.utils.hooks import collect_data_files
-import PyInstaller.versionfile
 
 APP_NAME = "TsarSecure"
 SCRIPT = "TsarSecure.py"
 ICON = "ts.ico"
 
-# Add runtime data files
-datas = [
-    ("eff_large_wordlist.txt", "."),
-]
+datas = [("eff_large_wordlist.txt", ".")]
 datas += collect_data_files("certifi")
 
 block_cipher = None
-
-# Embed Windows version info
-PyInstaller.versionfile.create_versionfile(
-    output_file="versionfile.txt",
-    version="2.5.0",
-    company_name="TsarSecure Project",
-    file_description="TsarSecure - Secure Password & Passphrase Generator",
-    internal_name=APP_NAME,
-    legal_copyright="© 2025 TsarSecure Project",
-    original_filename=f"{APP_NAME}.exe",
-    product_name=APP_NAME,
-    product_version="2.5.0"
-)
 
 a = Analysis(
     [SCRIPT],
@@ -52,9 +35,9 @@ exe = EXE(
     debug=False,
     strip=False,
     upx=True,
-    console=False,  # Consumer build – no console
+    console=False,      # consumer build
     icon=ICON,
-    version="versionfile.txt"
+    version="version.txt"   # <-- points to the file above
 )
 
 coll = COLLECT(
